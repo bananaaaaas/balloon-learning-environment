@@ -177,6 +177,64 @@ def find_adaptive_temperature(costs, target_ess_pct, num_envs, low=0.001, high=1
     
     return (final_bounds[0] + final_bounds[1]) / 2.0
 
+np.random.seed(seed=42)
+def get_initial_plans(balloon: JaxBalloon, num_plans, forecast: JaxWindField, atmosphere: JaxAtmosphere, plan_steps, time_delta, stride, dynamics_params: JaxBalloonDynamicsParams):
+    # flight_record = [(atmosphere.at_pressure(balloon.state.pressure).height.km, 0)]
+    flight_record = {atmosphere.at_pressure(balloon.state.pressure).height.km.item(): 0}
+
+    time_to_top = 0
+    max_km_to_explore = 19.1
+
+    up_balloon = balloon
+    while time_to_top < plan_steps and atmosphere.at_pressure(up_balloon.state.pressure).height.km < max_km_to_explore:
+        wind_vector = forecast.get_forecast(up_balloon.state.x/1000, up_balloon.state.y/1000, up_balloon.state.pressure, up_balloon.state.time_elapsed)
+        up_balloon = up_balloon.simulate_step_continuous(wind_vector, atmosphere, 0.99, time_delta, stride, dynamics_params)
+        time_to_top += 1
+
+        flight_record[atmosphere.at_pressure(up_balloon.state.pressure).height.km.item()] = time_to_top
+
+    time_to_bottom = 0
+    min_km_to_explore = 15.4
+
+    down_balloon = balloon
+    while time_to_bottom < plan_steps and atmosphere.at_pressure(down_balloon.state.pressure).height.km > min_km_to_explore:
+        wind_vector = forecast.get_forecast(down_balloon.state.x/1000, down_balloon.state.y/1000, down_balloon.state.pressure, down_balloon.state.time_elapsed)
+        down_balloon = down_balloon.simulate_step_continuous(wind_vector, atmosphere, -0.99, time_delta, stride, dynamics_params)
+        time_to_bottom += 1
+
+        flight_record[atmosphere.at_pressure(down_balloon.state.pressure).height.km.item()] = time_to_bottom
+    
+    # sorted (should be)
+    # flight_record = flight_record_down[::-1] + flight_record_up
+
+    # Sort the dictionary by keys (altitudes) and split them into two separate lists
+    sorted_flight_record = sorted(flight_record.items())
+
+    flight_record_altitudes = [altitude for altitude, _ in sorted_flight_record]
+    flight_record_steps = [steps for _, steps in sorted_flight_record]
+    
+    interpolator = scipy.interpolate.RegularGridInterpolator((flight_record_altitudes, ), flight_record_steps, bounds_error=False, fill_value=None)
+
+    plans = []
+
+    for i in range(num_plans):
+        random_height = np.random.uniform(15.4, 19.1)
+        going_up = random_height >= atmosphere.at_pressure(balloon.state.pressure).height.km
+        steps = max(int(round(interpolator(np.array([random_height]))[0])), 0)
+        # print(steps)
+
+        plan = np.zeros((plan_steps, ))
+        plan[:steps] = +0.99 if going_up else -0.99 
+        # print(random_height, steps)
+        if steps < plan_steps:
+            plan[steps:] += np.random.uniform(-0.3, 0.3, plan_steps - steps)
+
+
+        plans.append(plan)
+    
+    return np.array(plans)
+
+
 @register_pytree_node_class
 class MPPI:
     def __init__(
@@ -194,10 +252,13 @@ class MPPI:
         self.sample_indices = sample_indices
         self.sample_fn = sample_fn
 
-    def init(self, seed: int = 0) -> MPPIState:
+    def init(self, nominal_actions: jnp.ndarray =None, seed: int = 0) -> MPPIState:
         """Initialize the state."""
+        if nominal_actions is None:
+            nominal_actions = jnp.zeros((self.horizon, self.action_dim))
+
         return MPPIState(
-            nominal_actions=jnp.zeros((self.horizon, self.action_dim)),
+            nominal_actions=nominal_actions,
             rng=jax.random.PRNGKey(seed)
         )
 
@@ -475,11 +536,43 @@ class MPC5Agent(agent.Agent):
 
         # TODO: is it necessary to pass in forecast when just trying to get to a height?
         
+        initialization_type = None #  'best_altitude'
+        print('USING ' + initialization_type + ' INITIALIZATION')
+
+        initial_plan = None
+        if initialization_type == 'best_altitude':
+            initial_plans = get_initial_plans(self.balloon, 100, self.forecast, self.atmosphere, self.plan_steps, self.time_delta, self.stride, self.dynamics_params)
+
+            batched_cost = []
+            for i in range(len(initial_plans)):
+                # tmp = jax.make_jaxpr(jax_plan_cost, static_argnums=(5, 6))(initial_plans[i], self.balloon, self.forecast, self.atmosphere, self.terminal_cost_fn, self.time_delta, self.stride)
+                # print(tmp)
+
+                batched_cost.append(jax_plan_cost(initial_plans[i], self.balloon, self.forecast, self.atmosphere, self.terminal_cost_fn, self.time_delta, self.stride, self.dynamics_params))
+            
+            min_index_so_far = np.argmin(batched_cost)
+            min_value_so_far = batched_cost[min_index_so_far]
+
+            initial_plan = initial_plans[min_index_so_far]
+            if self.state is not None and jax_plan_cost(jnp.squeeze(self.state.nominal_actions), self.balloon, self.forecast, self.atmosphere, self.terminal_cost_fn, self.time_delta, self.stride, self.dynamics_params) < min_value_so_far:
+                print('Using the previous optimized plan as initial plan')
+                initial_plan = jnp.squeeze(self.state.nominal_actions)
+
+            coast = np.random.uniform(-0.2, 0.2, size=(self.plan_steps, ))
+            if jax_plan_cost(coast, self.balloon, self.forecast, self.atmosphere, self.terminal_cost_fn, self.time_delta, self.stride, self.dynamics_params) < min_value_so_far:
+                print('Using the nothing plan as initial plan')
+                initial_plan = coast
+
+            initial_plan = jnp.array(initial_plan)[:, None]
+
         _start = time.time()
         b4 = time.time()
         
         if self.state is None:
-            self.state = self.mppi.init(seed=0)
+            self.state = self.mppi.init(nominal_actions=initial_plan, seed=0)
+        elif initial_plan is not None:
+            self.state = MPPIState(initial_plan, self.state.rng)
+
         self.state = self.mppi_update(self.state, (self.balloon, self.forecast))
         _test_cost = jax_plan_cost(
                     jnp.squeeze(self.state.nominal_actions), 
