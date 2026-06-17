@@ -62,6 +62,11 @@ class WindGP(object):
     """
     self.time_horizon = 6 * 3600  # 6 hours.
 
+    print(wind_field.WindField.WIND_NOISE_SCALE, '!!!')
+
+    self.corrected_sigma_exp_squared = _SIGMA_EXP_SQUARED * wind_field.WindField.WIND_NOISE_SCALE**2
+    self.corrected_alpha = _SIGMA_NOISE_SQUARED * wind_field.WindField.WIND_NOISE_SCALE**2
+
     # TODO(bellemare): Add some documentation.
     # TODO(bellemare): I believe this is correct but needs to be validated.
     # The WindGP kernel is a Matern kernel.
@@ -69,12 +74,12 @@ class WindGP(object):
     # scaling factors.
     length_scale = np.array([
         _DISTANCE_SCALING, _DISTANCE_SCALING, _PRESSURE_SCALING, _TIME_SCALING])
-    self.kernel = _SIGMA_EXP_SQUARED * gaussian_process.kernels.Matern(
+    self.kernel = self.corrected_sigma_exp_squared * gaussian_process.kernels.Matern(
         length_scale=length_scale, length_scale_bounds='fixed', nu=0.5)
 
     self.model = gaussian_process.GaussianProcessRegressor(
         kernel=self.kernel,  # Matern kernel.
-        alpha=_SIGMA_NOISE_SQUARED,  # Add a term to the diagonal of the kernel.
+        alpha=self.corrected_alpha,  # Add a term to the diagonal of the kernel.
         optimizer=None,  # No optimization.
         )
     self.reset(forecast=forecast)
@@ -193,7 +198,7 @@ class WindGP(object):
       # TODO(bellemare): Ask what the actual lower bound is supposed to
       # be. We can't have a 0 std.dev. due to noise. Currently it's something
       # like 0.07 from the GP, but that doesn't seem to match the Loon code.
-      deviations = deviations**2 / _SIGMA_EXP_SQUARED
+      deviations = deviations**2 / self.corrected_sigma_exp_squared
 
       # Previously, there was a bug in sklearn which meant that the GP
       # only returned 1 deviation per location when it should have
