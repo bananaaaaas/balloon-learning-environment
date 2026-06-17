@@ -536,7 +536,7 @@ class MPC5Agent(agent.Agent):
 
         # TODO: is it necessary to pass in forecast when just trying to get to a height?
         
-        initialization_type = None #  'best_altitude'
+        initialization_type = 'best_altitude'
         print('USING ' + initialization_type + ' INITIALIZATION')
 
         initial_plan = None
